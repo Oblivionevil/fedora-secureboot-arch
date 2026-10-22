@@ -6,7 +6,7 @@
 
 pkgname=fedora-shim-grub
 pkgver=1.shim16.1_7.grub2.12_66
-pkgrel=1
+pkgrel=2
 pkgdesc='Fedora shim + GRUB for Secure Boot on Arch, with ESP sync hooks (EAC Linux v2)'
 arch=(x86_64)
 url='https://src.fedoraproject.org/rpms/shim'

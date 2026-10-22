@@ -8,7 +8,7 @@
 
 pkgname=linux-fedora
 pkgver=7.2.11.200
-pkgrel=1
+pkgrel=2
 pkgdesc='Fedora kernel and modules, Secure Boot signed by Fedora (EAC Linux v2)'
 arch=(x86_64)
 url='https://src.fedoraproject.org/rpms/kernel'
