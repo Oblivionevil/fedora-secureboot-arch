@@ -1,0 +1,55 @@
+# Prüft regelmäßig die stabilen Fedora-Repositories und schreibt neue Versionen
+# in die Branches versions-kernel / versions-bootloader. Der Buildserver beobachtet
+# diese Branches und baut die Pakete daraufhin automatisch neu.
+name: Fedora-Versionen
+
+on:
+  schedule:
+    - cron: '23 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fedora-versions
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Versionen ermitteln und veröffentlichen
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          mkdir -p "$RUNNER_TEMP/prev" "$RUNNER_TEMP/new"
+          for b in kernel bootloader; do
+            git show "origin/versions-$b:$b.env" >"$RUNNER_TEMP/prev/$b.env" 2>/dev/null \
+              || rm -f "$RUNNER_TEMP/prev/$b.env"
+          done
+
+          ci/update-versions.sh "$RUNNER_TEMP/new" "$RUNNER_TEMP/prev"
+
+          for b in kernel bootloader; do
+            if cmp -s "$RUNNER_TEMP/new/$b.env" "$RUNNER_TEMP/prev/$b.env"; then
+              echo "$b: unverändert"
+              continue
+            fi
+            wt="$RUNNER_TEMP/wt-$b"
+            if git rev-parse -q --verify "origin/versions-$b" >/dev/null; then
+              git worktree add -B "versions-$b" "$wt" "origin/versions-$b"
+            else
+              git worktree add --orphan -b "versions-$b" "$wt"
+            fi
+            cp "$RUNNER_TEMP/new/$b.env" "$wt/$b.env"
+            git -C "$wt" add "$b.env"
+            git -C "$wt" commit -m "$b: $(tr '\n' ' ' <"$wt/$b.env")"
+            git -C "$wt" push origin "versions-$b"
+          done

@@ -1,0 +1,94 @@
+# Maintainer: Oblivionevil <34569567+Oblivionevil@users.noreply.github.com>
+#
+# Fedora shim (Microsoft-signiert) und Fedora GRUB (Fedora-signiert) plus die
+# Werkzeuge, die beides auf die ESP bringen und grub.cfg erzeugen.
+# Die exakten Versionen kommen aus dem Branch "versions-bootloader" (GitHub-Bot).
+
+pkgname=fedora-shim-grub
+pkgver=1.shim16.1_7.grub2.12_66
+pkgrel=1
+pkgdesc='Fedora shim + GRUB for Secure Boot on Arch, with ESP sync hooks (EAC Linux v2)'
+arch=(x86_64)
+url='https://src.fedoraproject.org/rpms/shim'
+license=(BSD-2-Clause GPL-3.0-or-later)
+depends=(bash coreutils diffutils efibootmgr findutils grep util-linux)
+makedepends=(git curl rpm-tools)
+optdepends=('linux-fedora: Fedora-signierter Kernel'
+            'python: Auswertung der Secure-Boot-Datenbanken in fedora-sb-check'
+            'openssl: Auswertung der Secure-Boot-Datenbanken in fedora-sb-check')
+backup=(etc/fedora-sb.conf)
+options=(!strip !debug)
+install=fedora-shim-grub.install
+
+_repo=${FEDORA_SB_REPO:-https://github.com/Oblivionevil/fedora-secureboot-arch.git}
+_mirror=${FEDORA_MIRROR:-https://dl.fedoraproject.org/pub/fedora/linux}
+
+source=("versions::git+${_repo}#branch=versions-bootloader"
+        RPM-GPG-KEY-fedora-44-primary
+        RPM-GPG-KEY-fedora-45-primary
+        fedora-sb-sync
+        fedora-sb-check
+        fedora-sb.conf
+        95-fedora-sb.hook
+        05-fedora-sb-remove.hook)
+sha256sums=('SKIP'
+            '93642aec521a1e5e96dd715f7ae0ec0850ebc9de09a94ce03cae5263f26cc18a'
+            '846912c73a910dab32da8ef0c0d68cb89d11ff514f598d2d1dd96d04d58b2425'
+            '33b584a7265981c730e7d312331ba88c92a11ca6b92d1d0c6807af1696a52aba'
+            'e41022444591ac57002616b37c08ba15d8afe0f6e1ec128b36273af0c62fdeca'
+            'a6e9afb781d7198910848d3a3907025fb29834b86a4481ef40dfbafd6fde94bc'
+            'd489e307e5538fb68b44ef23d209dd55ed1d4db124f96ac804bfc8e611148751'
+            '6f46d39523d3ccbe36f410cb9b99c8168ee34bcdbffecaef0bc5b930ec2c2044')
+
+_load() {
+  # shellcheck disable=SC1091
+  source "$srcdir/versions/bootloader.env"
+}
+
+pkgver() {
+  _load
+  printf '%s.shim%s_%s.grub%s_%s' "$SERIAL" "$SHIM_VERSION" "$SHIM_RELEASE" \
+    "$GRUB_VERSION" "${GRUB_RELEASE%%.fc*}"
+}
+
+prepare() {
+  _load
+  local key=$srcdir/RPM-GPG-KEY-fedora-$FEDORA_RELEASE-primary f
+  [[ -f $key ]] || { echo "Kein Schlüssel für Fedora $FEDORA_RELEASE hinterlegt" >&2; return 1; }
+
+  rm -rf rpmdb rpms root
+  mkdir -p rpmdb rpms root
+  rpmkeys --dbpath "$srcdir/rpmdb" --import "$key"
+
+  for f in "$SHIM_PATH/shim-x64-$SHIM_VERSION-$SHIM_RELEASE.x86_64.rpm" \
+           "$GRUB_PATH/grub2-efi-x64-$GRUB_VERSION-$GRUB_RELEASE.x86_64.rpm"; do
+    curl -fL --retry 3 -o "rpms/${f##*/}" "$_mirror/$f"
+    rpmkeys --dbpath "$srcdir/rpmdb" --define '_pkgverify_level all' -K "rpms/${f##*/}" \
+      || { echo "Signaturprüfung fehlgeschlagen: ${f##*/}" >&2; return 1; }
+    bsdtar -xf "rpms/${f##*/}" -C root
+  done
+}
+
+# Genau eine Datei NAME unterhalb des entpackten RPM-Baums finden
+_one() {
+  local hits
+  mapfile -t hits < <(find "$srcdir/root" -path "*/EFI/fedora/$1" \( -type f -o -type l \))
+  (( ${#hits[@]} == 1 )) || { echo "$1: ${#hits[@]} Treffer statt 1" >&2; return 1; }
+  printf '%s' "${hits[0]}"
+}
+
+package() {
+  _load
+  local f
+  for f in shimx64.efi mmx64.efi grubx64.efi; do
+    install -Dm644 "$(_one "$f")" "$pkgdir/usr/lib/fedora-sb/efi/$f"
+  done
+  printf '%s\n' "shim-x64-$SHIM_VERSION-$SHIM_RELEASE" "grub2-efi-x64-$GRUB_VERSION-$GRUB_RELEASE" \
+    >"$pkgdir/usr/lib/fedora-sb/efi/VERSION"
+
+  install -Dm755 "$srcdir/fedora-sb-sync" "$pkgdir/usr/bin/fedora-sb-sync"
+  install -Dm755 "$srcdir/fedora-sb-check" "$pkgdir/usr/bin/fedora-sb-check"
+  install -Dm644 "$srcdir/fedora-sb.conf" "$pkgdir/etc/fedora-sb.conf"
+  install -Dm644 "$srcdir/95-fedora-sb.hook" "$pkgdir/usr/share/libalpm/hooks/95-fedora-sb.hook"
+  install -Dm644 "$srcdir/05-fedora-sb-remove.hook" "$pkgdir/usr/share/libalpm/hooks/05-fedora-sb-remove.hook"
+}

@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# fedora-sb-sync – bringt Fedora shim + GRUB auf die ESP, schreibt
+# ESP/EFI/fedora/grub.cfg und legt den UEFI-Booteintrag an.
+#
+#   fedora-sb-sync                    Dateien + grub.cfg aktualisieren
+#   fedora-sb-sync --bootorder-first  zusätzlich den Eintrag an Position 1 setzen
+#   fedora-sb-sync --remove           Dateien und Booteintrag entfernen
+#   fedora-sb-sync --print-config     erzeugte grub.cfg nur ausgeben
+set -euo pipefail
+shopt -s nullglob
+
+ESP=/boot/efi
+ENTRY_LABEL="Fedora Secure Boot (Arch)"
+CMDLINE=""
+EXTRA_CMDLINE=""
+EAC_CMDLINE=auto
+TIMEOUT=5
+OTHER_KERNELS=yes
+WINDOWS_ENTRY=auto
+# shellcheck disable=SC1091
+[[ -r /etc/fedora-sb.conf ]] && . /etc/fedora-sb.conf
+
+SRC=/usr/lib/fedora-sb/efi
+DIR=$ESP/EFI/fedora
+MARKER=$DIR/.managed-by-fedora-sb-arch
+LOADER_RE='\\EFI\\fedora\\shimx64\.efi'
+FEDORA_KERNEL=/boot/vmlinuz-linux-fedora
+
+msg() { echo "fedora-sb-sync: $*"; }
+warn() { echo "fedora-sb-sync: WARNUNG: $*" >&2; }
+die() { echo "fedora-sb-sync: FEHLER: $*" >&2; exit 1; }
+
+check_esp() {
+  mountpoint -q "$ESP" || die "$ESP ist nicht eingehängt"
+  [[ $(findmnt -no FSTYPE "$ESP") == vfat ]] || die "$ESP ist keine FAT-Partition"
+}
+
+# Atomar kopieren, nur wenn sich der Inhalt geändert hat
+put() {
+  local src=$1 dst=$2
+  cmp -s "$src" "$dst" && return 0
+  cp -- "$src" "$dst.new"
+  sync -f "$dst.new"
+  mv -f -- "$dst.new" "$dst"
+  msg "aktualisiert: $dst"
+}
+
+install_efi() {
+  if [[ -d $DIR && ! -e $MARKER && -n $(ls -A "$DIR") ]]; then
+    die "$DIR existiert bereits und wird nicht von fedora-sb verwaltet (echte Fedora-Installation?)"
+  fi
+  mkdir -p "$DIR"
+  : >"$MARKER"
+  local f
+  for f in shimx64.efi mmx64.efi grubx64.efi; do
+    [[ -f $SRC/$f ]] || die "$SRC/$f fehlt – ist fedora-shim-grub installiert?"
+    put "$SRC/$f" "$DIR/$f"
+  done
+}
+
+# GRUB-Pfad einer Datei: Pfad innerhalb ihres Dateisystems (inkl. btrfs-Subvolume)
+grub_path() {
+  local file=$1 target fsroot
+  target=$(findmnt -no TARGET -T "$file")
+  fsroot=$(findmnt -no FSROOT -T "$file")
+  fsroot=${fsroot%/}
+  printf '%s/%s' "$fsroot" "$(realpath --relative-to="$target" "$file")"
+}
+
+base_cmdline() {
+  if [[ -n $CMDLINE ]]; then
+    printf '%s' "$CMDLINE"
+    return
+  fi
+  local uuid fstype fsroot line
+  uuid=$(findmnt -no UUID /)
+  fstype=$(findmnt -no FSTYPE /)
+  line="root=UUID=$uuid rw"
+  if [[ $fstype == btrfs ]]; then
+    fsroot=$(findmnt -no FSROOT /)
+    [[ $fsroot != / ]] && line+=" rootflags=subvol=${fsroot#/}"
+  fi
+  if [[ -r /etc/default/grub ]]; then
+    line+=" $(
+      GRUB_CMDLINE_LINUX="" GRUB_CMDLINE_LINUX_DEFAULT=""
+      # shellcheck disable=SC1090
+      . <(grep -E '^GRUB_CMDLINE_LINUX(_DEFAULT)?=' /etc/default/grub)
+      printf '%s %s' "$GRUB_CMDLINE_LINUX" "$GRUB_CMDLINE_LINUX_DEFAULT"
+    )"
+  fi
+  printf '%s' "$line"
+}
+
+eac_cmdline() {
+  [[ $EAC_CMDLINE != auto ]] && { printf '%s' "$EAC_CMDLINE"; return; }
+  local line="lockdown=integrity sysctl.kernel.kexec_load_disabled=1 iommu.passthrough=0"
+  grep -qm1 GenuineIntel /proc/cpuinfo && line+=" intel_iommu=on"
+  printf '%s' "$line"
+}
+
+initrd_line() {
+  local img=$1 out="" u
+  for u in /boot/intel-ucode.img /boot/amd-ucode.img; do
+    [[ -f $u ]] && out+=" $(grub_path "$u")"
+  done
+  printf 'initrd%s %s' "$out" "$(grub_path "$img")"
+}
+
+generate_cfg() {
+  local boot_uuid esp_uuid base name img
+  boot_uuid=$(findmnt -no UUID -T /boot)
+  esp_uuid=$(findmnt -no UUID "$ESP")
+  base=$(base_cmdline | tr -s ' ')
+
+  cat <<EOF
+# Erzeugt von fedora-sb-sync – nicht von Hand bearbeiten.
+# Einstellungen: /etc/fedora-sb.conf, danach "sudo fedora-sb-sync".
+set timeout=$TIMEOUT
+set default=fedora-sb
+terminal_output console
+search --no-floppy --fs-uuid --set=root $boot_uuid
+
+EOF
+
+  if [[ -f $FEDORA_KERNEL ]]; then
+    cat <<EOF
+menuentry 'Arch Linux - Fedora-Kernel (Secure Boot / EAC)' --id fedora-sb {
+    echo 'Lade Fedora-Kernel ...'
+    linux $(grub_path "$FEDORA_KERNEL") $base $(eac_cmdline) $EXTRA_CMDLINE
+    $(initrd_line /boot/initramfs-linux-fedora.img)
+}
+
+EOF
+  else
+    warn "$FEDORA_KERNEL fehlt – ist linux-fedora installiert?"
+  fi
+
+  if [[ $OTHER_KERNELS == yes ]]; then
+    for img in /boot/vmlinuz-*; do
+      name=${img#/boot/vmlinuz-}
+      [[ $name == linux-fedora ]] && continue
+      [[ -f /boot/initramfs-$name.img ]] || continue
+      cat <<EOF
+menuentry 'Arch Linux - Kernel $name (nur ohne Secure Boot)' --id arch-$name {
+    linux $(grub_path "$img") $base
+    $(initrd_line "/boot/initramfs-$name.img")
+}
+
+EOF
+    done
+  fi
+
+  if [[ $WINDOWS_ENTRY == yes || ($WINDOWS_ENTRY == auto && -f $ESP/EFI/Microsoft/Boot/bootmgfw.efi) ]]; then
+    cat <<EOF
+menuentry 'Windows Boot Manager' --id windows {
+    search --no-floppy --fs-uuid --set=root $esp_uuid
+    chainloader /EFI/Microsoft/Boot/bootmgfw.efi
+}
+
+EOF
+  fi
+
+  cat <<'EOF'
+menuentry 'UEFI-Firmware-Einstellungen' --id uefi-firmware {
+    fwsetup
+}
+EOF
+}
+
+# Der Kernel in /boot muss byte-identisch mit dem von Fedora signierten sein
+verify_kernel() {
+  local orig
+  [[ -f $FEDORA_KERNEL ]] || return 0
+  for orig in /usr/lib/modules/*/vmlinuz; do
+    [[ -r ${orig%/vmlinuz}/pkgbase && $(<"${orig%/vmlinuz}/pkgbase") == linux-fedora ]] || continue
+    cmp -s "$orig" "$FEDORA_KERNEL" && return 0
+  done
+  warn "$FEDORA_KERNEL weicht vom Fedora-Original ab (neu signiert?) – sudo mkinitcpio -p linux-fedora"
+}
+
+write_cfg() {
+  local tmp
+  tmp=$(mktemp)
+  generate_cfg >"$tmp"
+  put "$tmp" "$DIR/grub.cfg"
+  rm -f "$tmp"
+}
+
+boot_entries() {
+  efibootmgr | grep -iE "$LOADER_RE" | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p'
+}
+
+ensure_bootentry() {
+  [[ -n $(boot_entries) ]] && return 0
+  local src disk part
+  src=$(findmnt -no SOURCE "$ESP")
+  disk=/dev/$(lsblk -no PKNAME "$src" | head -n1)
+  part=$(cat "/sys/class/block/${src##*/}/partition")
+  efibootmgr --create-only --disk "$disk" --part "$part" \
+    --label "$ENTRY_LABEL" --loader '\EFI\fedora\shimx64.efi' >/dev/null
+  msg "UEFI-Eintrag \"$ENTRY_LABEL\" angelegt (Startreihenfolge unverändert)"
+}
+
+bootorder_first() {
+  local id order
+  id=$(boot_entries | head -n1)
+  [[ -n $id ]] || die "kein Booteintrag für shimx64.efi gefunden"
+  order=$(efibootmgr | sed -n 's/^BootOrder: //p')
+  order=$(tr ',' '\n' <<<"$order" | grep -viFx "$id" | paste -sd, -)
+  efibootmgr --bootorder "$id${order:+,$order}" >/dev/null
+  msg "Boot$id steht jetzt an erster Stelle"
+}
+
+remove_all() {
+  local id
+  for id in $(boot_entries); do
+    efibootmgr --bootnum "$id" --delete-bootnum >/dev/null && msg "UEFI-Eintrag Boot$id entfernt"
+  done
+  if [[ -e $MARKER ]]; then
+    rm -f -- "$DIR"/{shimx64.efi,mmx64.efi,grubx64.efi,grub.cfg} "$MARKER"
+    rmdir --ignore-fail-on-non-empty -- "$DIR"
+    msg "$DIR bereinigt"
+  fi
+}
+
+case ${1:-} in
+  --print-config)
+    generate_cfg
+    exit 0
+    ;;
+esac
+
+(( EUID == 0 )) || die "bitte als root ausführen"
+[[ -d /sys/firmware/efi ]] || die "System läuft nicht im UEFI-Modus"
+check_esp
+
+case ${1:-} in
+  ""|--hook)
+    install_efi
+    verify_kernel
+    write_cfg
+    ensure_bootentry
+    ;;
+  --bootorder-first)
+    install_efi
+    verify_kernel
+    write_cfg
+    ensure_bootentry
+    bootorder_first
+    ;;
+  --remove)
+    remove_all
+    ;;
+  *)
+    die "unbekannte Option: $1"
+    ;;
+esac

@@ -1,0 +1,11 @@
+# mkinitcpio preset file for the 'linux-fedora' package
+#
+# --nopost: Post-Hooks (z.B. der von sbctl) dürfen den von Fedora signierten
+# Kernel nicht verändern oder neu signieren.
+
+ALL_kver="/boot/vmlinuz-linux-fedora"
+
+PRESETS=('default')
+
+default_image="/boot/initramfs-linux-fedora.img"
+default_options="--nopost"

@@ -1,0 +1,84 @@
+# Maintainer: Oblivionevil <34569567+Oblivionevil@users.noreply.github.com>
+#
+# Der unveränderte, von Fedora für Secure Boot signierte Kernel samt Modulen.
+# Die exakte Version kommt aus dem Branch "versions-kernel" (GitHub-Bot), die
+# RPMs werden gegen die hier hinterlegten Fedora-Schlüssel geprüft.
+# Kernel und Module dürfen NICHT verändert oder gestrippt werden, sonst sind
+# die Signaturen ungültig.
+
+pkgname=linux-fedora
+pkgver=7.2.11.200
+pkgrel=1
+pkgdesc='Fedora kernel and modules, Secure Boot signed by Fedora (EAC Linux v2)'
+arch=(x86_64)
+url='https://src.fedoraproject.org/rpms/kernel'
+license=(GPL-2.0-only)
+depends=(coreutils kmod initramfs)
+makedepends=(git curl rpm-tools)
+optdepends=('fedora-shim-grub: Fedora shim + GRUB für den Secure-Boot-Start'
+            'linux-firmware: Firmware für Grafik, WLAN usw.')
+backup=(etc/mkinitcpio.d/linux-fedora.preset)
+options=(!strip !debug !lto)
+
+_repo=${FEDORA_SB_REPO:-https://github.com/Oblivionevil/fedora-secureboot-arch.git}
+_mirror=${FEDORA_MIRROR:-https://dl.fedoraproject.org/pub/fedora/linux}
+
+source=("versions::git+${_repo}#branch=versions-kernel"
+        RPM-GPG-KEY-fedora-44-primary
+        RPM-GPG-KEY-fedora-45-primary
+        linux-fedora.preset)
+sha256sums=('SKIP'
+            '93642aec521a1e5e96dd715f7ae0ec0850ebc9de09a94ce03cae5263f26cc18a'
+            '846912c73a910dab32da8ef0c0d68cb89d11ff514f598d2d1dd96d04d58b2425'
+            '54f623179414bc3b2ffcd42421def394b5026e54db63812128a143b64b63fbef')
+
+_load() {
+  # shellcheck disable=SC1091
+  source "$srcdir/versions/kernel.env"
+  _kver=$KERNEL_VERSION-$KERNEL_RELEASE.x86_64
+}
+
+pkgver() {
+  _load
+  printf '%s.%s' "$KERNEL_VERSION" "${KERNEL_RELEASE%%.*}"
+}
+
+prepare() {
+  _load
+  local key=$srcdir/RPM-GPG-KEY-fedora-$FEDORA_RELEASE-primary p f
+  [[ -f $key ]] || { echo "Kein Schlüssel für Fedora $FEDORA_RELEASE hinterlegt" >&2; return 1; }
+
+  rm -rf rpmdb rpms root
+  mkdir -p rpmdb rpms root
+  rpmkeys --dbpath "$srcdir/rpmdb" --import "$key"
+
+  for p in core modules-core modules modules-extra; do
+    f=kernel-$p-$KERNEL_VERSION-$KERNEL_RELEASE.x86_64.rpm
+    curl -fL --retry 3 -o "rpms/$f" "$_mirror/$KERNEL_PATH/$f"
+    rpmkeys --dbpath "$srcdir/rpmdb" --define '_pkgverify_level all' -K "rpms/$f" \
+      || { echo "Signaturprüfung fehlgeschlagen: $f" >&2; return 1; }
+    bsdtar -xf "rpms/$f" -C root
+  done
+}
+
+package() {
+  _load
+  local modules=$pkgdir/usr/lib/modules/$_kver
+
+  install -dm755 "$pkgdir/usr/lib"
+  cp -a --no-preserve=ownership "$srcdir/root/lib/modules" "$pkgdir/usr/lib/"
+
+  # Fedora-spezifische Verweise auf nicht vorhandene Header/DKMS-Pfade
+  rm -f "$modules/build" "$modules/source" "$modules/.vmlinuz.hmac"
+  rm -rf "$modules/systemtap" "$modules/updates" "$modules/weak-updates"
+
+  # mkinitcpio kopiert vmlinuz damit nach /boot/vmlinuz-linux-fedora und
+  # baut /boot/initramfs-linux-fedora.img
+  echo "$pkgname" >"$modules/pkgbase"
+  install -Dm644 "$srcdir/linux-fedora.preset" "$pkgdir/etc/mkinitcpio.d/linux-fedora.preset"
+
+  install -Dm644 "$srcdir/root/usr/share/doc/kernel-keys/$_kver/kernel-signing-ca.cer" \
+    "$pkgdir/usr/share/doc/$pkgname/kernel-signing-ca.cer"
+  install -Dm644 "$srcdir"/root/usr/share/licenses/kernel-core/COPYING-* \
+    "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

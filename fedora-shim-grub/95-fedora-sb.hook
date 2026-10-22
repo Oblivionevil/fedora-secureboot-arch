@@ -1,0 +1,18 @@
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = fedora-shim-grub
+Target = linux-fedora
+
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = usr/lib/modules/*/vmlinuz
+
+[Action]
+Description = Updating Fedora shim/GRUB on the ESP...
+When = PostTransaction
+Exec = /usr/bin/fedora-sb-sync --hook

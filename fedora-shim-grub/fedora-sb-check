@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# fedora-sb-check – prüft die bekannten Anforderungen von EAC Linux v2 am
+# laufenden System. Für vollständige Ergebnisse als root ausführen.
+set -uo pipefail
+shopt -s nullglob
+
+GUID_GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
+GUID_DB=d719b2cb-3d3a-4596-a3bc-dad00e67656f
+EFIVARS=/sys/firmware/efi/efivars
+declare -i bad=0
+
+ok()   { printf '  \e[32m[ OK ]\e[0m %s\n' "$*"; }
+fail() { printf '  \e[31m[FEHL]\e[0m %s\n' "$*"; bad+=1; }
+info() { printf '  \e[33m[INFO]\e[0m %s\n' "$*"; }
+
+efivar_byte() { # letztes Byte einer EFI-Variable
+  local f=$EFIVARS/$1
+  [[ -r $f ]] || return 1
+  od -An -t u1 -j 4 -N 1 "$f" | tr -d ' '
+}
+
+# X.509-Subjects aus einer EFI-Signaturliste (db, MokListRT …)
+esl_subjects() {
+  command -v python3 >/dev/null && command -v openssl >/dev/null || return 2
+  python3 -I - "$1" "$2" <<'EOF'
+import struct, subprocess, sys, uuid
+X509 = uuid.UUID('a5c059a1-94e4-4aa7-87b5-ab155c2bf072')
+data = open(sys.argv[1], 'rb').read()[int(sys.argv[2]):]
+o = 0
+while o + 28 <= len(data):
+    t = uuid.UUID(bytes_le=data[o:o+16])
+    lsize, hsize, ssize = struct.unpack('<III', data[o+16:o+28])
+    if lsize == 0:
+        break
+    b, end = o + 28 + hsize, o + lsize
+    while t == X509 and b + ssize <= end:
+        r = subprocess.run(['openssl', 'x509', '-inform', 'DER', '-noout', '-subject', '-nameopt', 'oneline'],
+                           input=data[b+16:b+ssize], capture_output=True)
+        print(r.stdout.decode().strip().removeprefix('subject='))
+        b += ssize
+    o = end
+EOF
+}
+
+KNOWN='Microsoft|Canonical|Fedora|Red Hat|Debian|SUSE|openSUSE|Universal Blue|Rocky|AlmaLinux'
+
+echo "Secure Boot / Firmware"
+sb=$(efivar_byte SecureBoot-$GUID_GLOBAL || echo "?")
+sm=$(efivar_byte SetupMode-$GUID_GLOBAL || echo "?")
+[[ $sb == 1 ]] && ok "Secure Boot ist aktiv" || fail "Secure Boot ist AUS"
+[[ $sm == 0 ]] && ok "Setup Mode aus" || fail "Firmware im Setup Mode"
+
+if f=($EFIVARS/db-$GUID_DB) && (( ${#f[@]} )); then
+  if subjects=$(esl_subjects "${f[0]}" 4); then
+    while IFS= read -r s; do
+      [[ -z $s ]] && continue
+      if grep -qE "$KNOWN" <<<"$s"; then ok "db: $s"
+      elif grep -qiE 'frame\.work|Lenovo|Dell|HP |ASUS|Acer|MSI|Gigabyte|Insyde|AMI' <<<"$s"; then info "db (Hersteller-Werksschlüssel): $s"
+      else fail "db: eigener/unbekannter Schlüssel: $s  -> Werksschlüssel im UEFI wiederherstellen"
+      fi
+    done <<<"$subjects"
+  else
+    info "db nicht auswertbar (python3 + openssl nötig)"
+  fi
+fi
+
+mok=/sys/firmware/efi/mok-variables/MokListRT
+[[ -r $mok ]] || { mok=(/sys/firmware/efi/efivars/MokListRT-*); mok=${mok[0]:-}; }
+if [[ -n $mok && -r $mok ]]; then
+  off=0; [[ $mok == $EFIVARS/* ]] && off=4
+  while IFS= read -r s; do
+    [[ -z $s ]] && continue
+    if grep -q 'Fedora Secure Boot CA' <<<"$s"; then ok "shim-Vendor-Zertifikat: $s"
+    else fail "selbst eingeschriebener MOK-Schlüssel: $s  -> mit mokutil --delete entfernen"
+    fi
+  done < <(esl_subjects "$mok" "$off")
+else
+  info "keine MOK-Liste sichtbar (nicht über shim gestartet?)"
+fi
+
+echo "Kernel"
+krel=$(uname -r)
+[[ $krel == *.fc[0-9]*.x86_64 ]] && ok "Fedora-Kernel läuft: $krel" || fail "kein Fedora-Kernel: $krel"
+taint=$(</proc/sys/kernel/tainted)
+(( taint & 8192 )) && fail "unsignierte Module geladen (taint E)" || ok "keine unsignierten Module geladen"
+(( taint & 4096 )) && info "Out-of-tree-Module geladen (taint O)"
+
+lockdown=$(cat /sys/kernel/security/lockdown 2>/dev/null || echo "?")
+[[ $lockdown == *"[integrity]"* ]] && ok "Lockdown: integrity" || fail "Lockdown nicht integrity: $lockdown"
+grep -qw 'lockdown=integrity' /proc/cmdline && ok "lockdown=integrity beim Booten gesetzt" || fail "lockdown=integrity fehlt in der Kommandozeile"
+
+kd=$(cat /proc/sys/kernel/kexec_load_disabled 2>/dev/null || echo "?")
+[[ $kd == 1 ]] && ok "kexec deaktiviert" || fail "kexec nicht deaktiviert ($kd)"
+grep -qw 'sysctl.kernel.kexec_load_disabled=1' /proc/cmdline && ok "kexec beim Booten deaktiviert" || fail "sysctl.kernel.kexec_load_disabled=1 fehlt in der Kommandozeile"
+
+lsm=$(cat /sys/kernel/security/lsm 2>/dev/null || echo "?")
+[[ ,$lsm, == *,bpf,* ]] && ok "BPF-LSM aktiv ($lsm)" || fail "BPF-LSM nicht aktiv ($lsm)"
+
+groups=(/sys/kernel/iommu_groups/*)
+(( ${#groups[@]} )) && ok "IOMMU aktiv (${#groups[@]} Gruppen)" || fail "keine IOMMU-Gruppen – IOMMU/VT-d im UEFI aktivieren"
+grep -qE '(^| )(iommu=pt|iommu.passthrough=1)( |$)' /proc/cmdline && fail "IOMMU-Passthrough ist eingeschaltet" || ok "kein IOMMU-Passthrough"
+
+echo "TPM / Measured Boot"
+v=$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo "?")
+[[ $v == 2 ]] && ok "TPM 2.0 vorhanden" || fail "kein TPM 2.0 ($v)"
+[[ -e /sys/kernel/security/tpm0/binary_bios_measurements ]] && ok "TPM-Eventlog vorhanden (Measured Boot)" || fail "kein TPM-Eventlog"
+
+echo
+(( bad == 0 )) && echo "Alle geprüften Punkte erfüllt." || echo "$bad Punkt(e) nicht erfüllt."
+exit $(( bad > 0 ))
