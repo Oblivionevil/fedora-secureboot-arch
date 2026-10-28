@@ -8,8 +8,8 @@
 # Für EAC Linux v2 ist das der einzige Kernel: die Arch-Kernel werden ersetzt.
 
 pkgname=linux-fedora
-pkgver=7.2.11.200
-pkgrel=3
+pkgver=7.2.13.200
+pkgrel=4
 pkgdesc='Fedora kernel and modules, Secure Boot signed by Fedora (EAC Linux v2)'
 arch=(x86_64)
 url='https://src.fedoraproject.org/rpms/kernel'
@@ -19,6 +19,8 @@ makedepends=(git curl rpm-tools)
 optdepends=('fedora-shim-grub: Fedora shim + GRUB für den Secure-Boot-Start'
             'linux-firmware: Firmware für Grafik, WLAN usw.')
 conflicts=(linux linux-lts linux-zen linux-hardened linux-rt linux-rt-lts)
+# Wie Arch-linux, soweit die Module im Fedora-Kernel stecken (geprüft in package())
+provides=(NTSYNC-MODULE VIRTUALBOX-GUEST-MODULES WIREGUARD-MODULE)
 backup=(etc/mkinitcpio.d/linux-fedora.preset)
 options=(!strip !debug !lto)
 
@@ -73,6 +75,13 @@ package() {
   # Fedora-spezifische Verweise auf nicht vorhandene Header/DKMS-Pfade
   rm -f "$modules/build" "$modules/source" "$modules/.vmlinuz.hmac"
   rm -rf "$modules/systemtap" "$modules/updates" "$modules/weak-updates"
+
+  # Module hinter den provides – fehlt eins, müssen die provides angepasst werden
+  local m
+  for m in ntsync vboxguest vboxsf wireguard; do
+    [[ -n $(find "$modules/kernel" -name "$m.ko*" -print -quit) ]] \
+      || { echo "Modul $m fehlt im Fedora-Kernel – provides anpassen" >&2; return 1; }
+  done
 
   # mkinitcpio kopiert vmlinuz damit nach /boot/vmlinuz-linux-fedora und
   # baut /boot/initramfs-linux-fedora.img
