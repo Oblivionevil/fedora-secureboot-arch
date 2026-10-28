@@ -30,11 +30,12 @@ Alle RPMs werden beim Bauen gegen die hier hinterlegten Fedora-Schlüssel geprü
 * Ein neues Fedora-Release wird erst verwendet, wenn sein Schlüssel in `keys/` und in den
   Paketordnern liegt.
 
-Alternativ lokal bauen:
+Alternativ lokal bauen – `fedora-shim-grub` zuerst, damit beim Entfernen des Arch-Kernels schon
+der Fedora-Bootloader bereitsteht:
 
 ```bash
-cd linux-fedora && makepkg -si        # braucht rpm-tools
-cd ../fedora-shim-grub && makepkg -si
+cd fedora-shim-grub && makepkg -si    # braucht rpm-tools
+cd ../linux-fedora && makepkg -si
 ```
 
 `FEDORA_SB_REPO` und `FEDORA_MIRROR` überschreiben Versions-Repo und Mirror.
@@ -58,15 +59,52 @@ Im UEFI-Setup:
 **Keine MOK-Schlüssel einschreiben** (`mokutil --import`): EAC wertet selbst eingeschriebene
 Schlüssel als unbekannt.
 
+## Nur Fedora-GRUB und Fedora-Kernel
+
+Für EAC Linux v2 bleiben nur der Fedora-GRUB und der Fedora-Kernel installiert:
+
+* `linux-fedora` ersetzt die Arch-Kernel (`linux`, `linux-lts`, `linux-zen`, `linux-hardened`,
+  `linux-rt`, `linux-rt-lts`), `fedora-shim-grub` ersetzt `grub`, `refind` und `limine`. pacman fragt
+  beim Installieren, ob sie entfernt werden sollen. Pakete, die vom Arch-Kernel abhängen (z.B. `nvidia`),
+  müssen mit entfernt werden.
+* Das GRUB-Menü enthält nur den Fedora-Kernel (dazu Windows, die UEFI-Einstellungen und eigene
+  Einträge).
+* Steht in der UEFI-Startreihenfolge noch ein anderer Linux-Bootloader (z.B. Arch-GRUB) vorne, setzt
+  `fedora-sb-sync` den Fedora-shim davor, sobald nur noch `linux-fedora` installiert ist. Sonst würde
+  der alte Bootloader einen gelöschten Kernel suchen.
+* Was pacman nicht entfernt, also alte Bootloader auf der ESP (z.B. `EFI/GRUB`), deren UEFI-Einträge
+  und AUR-Kernel, zeigt `sudo fedora-sb-check` jeweils mit dem Befehl zum Entfernen.
+
+## Einstellungen aus dem ursprünglichen GRUB
+
+`fedora-sb-sync` baut `ESP/EFI/fedora/grub.cfg` wie `grub-mkconfig` aus `/etc/default/grub` und
+`/etc/grub.d/40_custom`. Die Einstellungen bleiben also, wo sie waren. Nach einer Änderung
+`sudo fedora-sb-sync` statt `grub-mkconfig` ausführen. Entfernt pacman Arch-`grub`, landen geänderte
+Dateien als `.pacsave`; `fedora-sb-sync` legt sie wieder an ihren Platz.
+
+Übernommen werden:
+
+| Bereich | Einstellungen |
+|---|---|
+| Standardeintrag | `GRUB_DEFAULT` (auch `saved`), `GRUB_SAVEDEFAULT`, `grub-reboot`-Einträge (`next_entry`); `grubenv` liegt unter `ESP/EFI/fedora/` |
+| Menü | `GRUB_TIMEOUT`, `GRUB_TIMEOUT_STYLE`, `GRUB_DISTRIBUTOR`, `GRUB_DISABLE_RECOVERY`, `GRUB_DISABLE_SUBMENU`, `GRUB_DISABLE_OS_PROBER` (Windows auf der ESP) |
+| Kernel | `GRUB_CMDLINE_LINUX`, `GRUB_CMDLINE_LINUX_DEFAULT`, `GRUB_CMDLINE_LINUX_RECOVERY`, `GRUB_DISABLE_LINUX_UUID`, `GRUB_DISABLE_LINUX_PARTUUID`, `GRUB_EARLY_INITRD_LINUX_STOCK`/`_CUSTOM` |
+| Anzeige | `GRUB_TERMINAL`, `GRUB_TERMINAL_INPUT`/`_OUTPUT`, `GRUB_SERIAL_COMMAND`, `GRUB_GFXMODE`, `GRUB_GFXPAYLOAD_LINUX`, `GRUB_VIDEO_BACKEND`, `GRUB_FONT`, `GRUB_THEME`, `GRUB_COLOR_NORMAL`/`_HIGHLIGHT`, `GRUB_INIT_TUNE`, Sprache aus `LANG` (Übersetzungen aus `/boot/grub/locale`) |
+| Sonstiges | `GRUB_PRELOAD_MODULES`, `GRUB_ENABLE_CRYPTODISK` (verschlüsseltes `/boot`), eigene Einträge aus `40_custom` und `custom.cfg` |
+
+Nicht übernommen werden `GRUB_BACKGROUND` (dem Fedora-GRUB fehlt `background_image`; ein Theme geht)
+sowie die Einträge aus `31_efi_bootnext` (Modul fehlt) und andere Skripte in `/etc/grub.d`.
+Unter Secure Boot lädt der Fedora-GRUB nur seine eingebauten Module.
+`/etc/fedora-sb.conf` kann den Timeout, die Kommandozeile und den Windows-Eintrag überschreiben.
+
 ## Was sich unter dem Fedora-Kernel ändert
 
 * Kernel-Parameter: die aus `/etc/default/grub` plus
   `lockdown=integrity sysctl.kernel.kexec_load_disabled=1 iommu.passthrough=0` (Intel: `intel_iommu=on`).
-  Anpassen in `/etc/fedora-sb.conf`, danach `sudo fedora-sb-sync`.
+  Die EAC-Parameter lassen sich in `/etc/fedora-sb.conf` anpassen, danach `sudo fedora-sb-sync`.
 * Es laden nur Fedora-signierte Module; DKMS-/Out-of-tree-Module funktionieren nicht. Für den
   Fedora-Kernel werden bewusst keine Header installiert, damit DKMS dort nichts baut.
 * Hibernate ist durch Lockdown gesperrt, Suspend funktioniert.
-* Andere Kernel (z.B. Arch-`linux`) stehen im Menü, starten aber nur ohne Secure Boot.
 * mkinitcpio-Post-Hooks (z.B. sbctl) sind für `linux-fedora` abgeschaltet (`--nopost` im Preset),
   damit der Fedora-Kernel nicht neu signiert wird.
 

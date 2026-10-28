@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # fedora-sb-sync – bringt Fedora shim + GRUB auf die ESP, schreibt
 # ESP/EFI/fedora/grub.cfg und legt den UEFI-Booteintrag an.
+# Die GRUB-Einstellungen kommen wie bei grub-mkconfig aus /etc/default/grub
+# und /etc/grub.d/40_custom – nach Änderungen dort einfach fedora-sb-sync.
 #
 #   fedora-sb-sync                    Dateien + grub.cfg aktualisieren
 #   fedora-sb-sync --bootorder-first  zusätzlich den Eintrag an Position 1 setzen
@@ -14,8 +16,7 @@ ENTRY_LABEL="Fedora Secure Boot (Arch)"
 CMDLINE=""
 EXTRA_CMDLINE=""
 EAC_CMDLINE=auto
-TIMEOUT=5
-OTHER_KERNELS=yes
+TIMEOUT=""
 WINDOWS_ENTRY=auto
 # shellcheck disable=SC1091
 [[ -r /etc/fedora-sb.conf ]] && . /etc/fedora-sb.conf
@@ -24,7 +25,44 @@ SRC=/usr/lib/fedora-sb/efi
 DIR=$ESP/EFI/fedora
 MARKER=$DIR/.managed-by-fedora-sb-arch
 LOADER_RE='\\EFI\\fedora\\shimx64\.efi'
+# Andere Linux-Bootloader (Arch-GRUB, systemd-boot, rEFInd, Limine, UKIs) – auch in fedora-sb-check
+FOREIGN_RE='[\\/]EFI[\\/](limine|linux)[\\/]|[\\/](grub|shim|systemd-boot|refind|limine)[^\\/]*\.efi'
 FEDORA_KERNEL=/boot/vmlinuz-linux-fedora
+GRUB_DEFAULTS=/etc/default/grub
+GRUB_CUSTOM_DIR=/etc/grub.d
+
+# Einstellungen des ursprünglichen GRUB mit den Standardwerten von grub-mkconfig.
+# Nach dem Entfernen von Arch-grub liegen sie zunächst in der .pacsave.
+load_grub_defaults() {
+  local f=$GRUB_DEFAULTS
+  GRUB_DEFAULT=0 GRUB_SAVEDEFAULT="" GRUB_TIMEOUT=5 GRUB_TIMEOUT_STYLE=menu GRUB_DISTRIBUTOR=Arch
+  GRUB_CMDLINE_LINUX="" GRUB_CMDLINE_LINUX_DEFAULT="" GRUB_CMDLINE_LINUX_RECOVERY=single
+  GRUB_DISABLE_RECOVERY="" GRUB_DISABLE_SUBMENU="" GRUB_DISABLE_OS_PROBER=true
+  GRUB_DISABLE_LINUX_UUID="" GRUB_DISABLE_LINUX_PARTUUID=true GRUB_ENABLE_CRYPTODISK=""
+  GRUB_PRELOAD_MODULES="" GRUB_TERMINAL="" GRUB_TERMINAL_INPUT="" GRUB_TERMINAL_OUTPUT=""
+  GRUB_SERIAL_COMMAND=serial GRUB_GFXMODE=auto GRUB_GFXPAYLOAD_LINUX="" GRUB_VIDEO_BACKEND=""
+  GRUB_FONT="" GRUB_THEME="" GRUB_BACKGROUND="" GRUB_COLOR_NORMAL="" GRUB_COLOR_HIGHLIGHT=""
+  GRUB_INIT_TUNE=""
+  GRUB_EARLY_INITRD_LINUX_STOCK="intel-uc.img intel-ucode.img amd-uc.img amd-ucode.img early_ucode.cpio microcode.cpio"
+  GRUB_EARLY_INITRD_LINUX_CUSTOM=""
+  [[ -r $f ]] || f+=.pacsave
+  if [[ -r $f ]]; then
+    set +u
+    # shellcheck disable=SC1090
+    . <(grep -E '^[[:space:]]*(export[[:space:]]+)?GRUB_[A-Z0-9_]+=' "$f")
+    set -u
+  else
+    # Ohne GRUB-Einstellungen wie bisher: kein Wiederherstellungs-Eintrag, Windows falls vorhanden
+    GRUB_DISABLE_RECOVERY=true GRUB_DISABLE_OS_PROBER=false
+  fi
+  # Menütitel und Theme-Klassen wie in 10_linux
+  OS=GNU/Linux CLASSES="--class gnu-linux --class gnu --class os"
+  if [[ -n $GRUB_DISTRIBUTOR ]]; then
+    OS="$GRUB_DISTRIBUTOR Linux"
+    CLASSES="--class $(tr 'A-Z' 'a-z' <<<"${GRUB_DISTRIBUTOR%% *}" | sed 's/[^[:alnum:]_]/_/g') $CLASSES"
+  fi
+}
+load_grub_defaults
 
 msg() { echo "fedora-sb-sync: $*"; }
 warn() { echo "fedora-sb-sync: WARNUNG: $*" >&2; }
@@ -56,6 +94,23 @@ install_efi() {
     [[ -f $SRC/$f ]] || die "$SRC/$f fehlt – ist fedora-shim-grub installiert?"
     put "$SRC/$f" "$DIR/$f"
   done
+  # Umgebungsblock für GRUB_DEFAULT=saved und GRUB_SAVEDEFAULT; bleibt bei Updates erhalten
+  if [[ ! -f $DIR/grubenv ]]; then
+    local head=$'# GRUB Environment Block\n'
+    { printf '%s' "$head"; printf '%*s' $((1024 - ${#head})) '' | tr ' ' '#'; } >"$DIR/grubenv"
+    msg "angelegt: $DIR/grubenv"
+  fi
+}
+
+# Nach dem Entfernen von Arch-grub die gesicherten Einstellungen zurückholen, damit sie
+# weiter wie gewohnt in /etc/default/grub und /etc/grub.d/40_custom stehen
+restore_grub_files() {
+  local f
+  for f in "$GRUB_DEFAULTS" "$GRUB_CUSTOM_DIR/40_custom"; do
+    [[ ! -e $f && -f $f.pacsave ]] || continue
+    cp -p -- "$f.pacsave" "$f"
+    msg "$f aus $f.pacsave wiederhergestellt"
+  done
 }
 
 # GRUB-Pfad einer Datei: Pfad innerhalb ihres Dateisystems (inkl. btrfs-Subvolume)
@@ -67,26 +122,35 @@ grub_path() {
   printf '%s/%s' "$fsroot" "$(realpath --relative-to="$target" "$file")"
 }
 
-base_cmdline() {
-  if [[ -n $CMDLINE ]]; then
-    printf '%s' "$CMDLINE"
-    return
+# Wie prepare_grub_to_access_device: Dateisystem von $1 als root setzen und
+# bei GRUB_ENABLE_CRYPTODISK=y vorher die LUKS-Container öffnen; $2 = Einrückung
+access_fs() {
+  local src fstype uuid
+  src=$(findmnt -no SOURCE -v -T "$1")
+  if [[ $GRUB_ENABLE_CRYPTODISK == y && -b $src ]]; then
+    while read -r fstype uuid; do
+      [[ $fstype == crypto_LUKS ]] && printf '%scryptomount -u %s\n' "${2:-}" "${uuid//-/}"
+    done < <(lsblk -nrso FSTYPE,UUID "$src")
   fi
-  local uuid fstype fsroot line
-  uuid=$(findmnt -no UUID /)
-  fstype=$(findmnt -no FSTYPE /)
-  line="root=UUID=$uuid rw"
-  if [[ $fstype == btrfs ]]; then
+  printf '%ssearch --no-floppy --fs-uuid --set=root %s\n' "${2:-}" "$(findmnt -no UUID -T "$1")"
+}
+
+# root= wie in 10_linux: UUID, sonst Gerät (immer bei LVM) bzw. PARTUUID; dazu btrfs-Subvolume
+root_cmdline() {
+  local dev fsroot line
+  dev=$(findmnt -no SOURCE -v /)
+  if [[ $GRUB_DISABLE_LINUX_UUID == true ]] || lsblk -nro TYPE "$dev" 2>/dev/null | grep -qx lvm; then
+    line="root=$dev"
+    if [[ $GRUB_DISABLE_LINUX_UUID == true && $GRUB_DISABLE_LINUX_PARTUUID == false ]]; then
+      line="root=PARTUUID=$(lsblk -no PARTUUID "$dev")"
+    fi
+  else
+    line="root=UUID=$(findmnt -no UUID /)"
+  fi
+  line+=" rw"
+  if [[ $(findmnt -no FSTYPE /) == btrfs ]]; then
     fsroot=$(findmnt -no FSROOT /)
     [[ $fsroot != / ]] && line+=" rootflags=subvol=${fsroot#/}"
-  fi
-  if [[ -r /etc/default/grub ]]; then
-    line+=" $(
-      GRUB_CMDLINE_LINUX="" GRUB_CMDLINE_LINUX_DEFAULT=""
-      # shellcheck disable=SC1090
-      . <(grep -E '^GRUB_CMDLINE_LINUX(_DEFAULT)?=' /etc/default/grub)
-      printf '%s %s' "$GRUB_CMDLINE_LINUX" "$GRUB_CMDLINE_LINUX_DEFAULT"
-    )"
   fi
   printf '%s' "$line"
 }
@@ -98,73 +162,237 @@ eac_cmdline() {
   printf '%s' "$line"
 }
 
+# Kernel-Kommandozeile; $1 = normal | recovery
+linux_cmdline() {
+  local line
+  if [[ -n $CMDLINE ]]; then
+    line=$CMDLINE
+  else
+    line="$(root_cmdline) $GRUB_CMDLINE_LINUX"
+    [[ $1 == normal ]] && line+=" $GRUB_CMDLINE_LINUX_DEFAULT"
+  fi
+  [[ $1 == recovery ]] && line+=" $GRUB_CMDLINE_LINUX_RECOVERY"
+  line=$(tr -s ' ' <<<"$line $(eac_cmdline) $EXTRA_CMDLINE")
+  line=${line# }
+  printf '%s' "${line% }"
+}
+
+# Microcode usw. wie GRUB_EARLY_INITRD_LINUX_STOCK/_CUSTOM in 10_linux
 initrd_line() {
   local img=$1 out="" u
-  for u in /boot/intel-ucode.img /boot/amd-ucode.img; do
-    [[ -f $u ]] && out+=" $(grub_path "$u")"
+  for u in $GRUB_EARLY_INITRD_LINUX_STOCK $GRUB_EARLY_INITRD_LINUX_CUSTOM; do
+    [[ -f /boot/$u ]] && out+=" $(grub_path "/boot/$u")"
   done
   printf 'initrd%s %s' "$out" "$(grub_path "$img")"
 }
 
-generate_cfg() {
-  local boot_uuid esp_uuid base name img
-  boot_uuid=$(findmnt -no UUID -T /boot)
-  esp_uuid=$(findmnt -no UUID "$ESP")
-  base=$(base_cmdline | tr -s ' ')
+# 00_header: Module, Standardeintrag, Schrift, Sprache, Terminal, Timeout, Theme
+cfg_header() {
+  local def=$GRUB_DEFAULT out input style lang dir m f
+  [[ $def == saved ]] && def='${saved_entry}'
+  out=${GRUB_TERMINAL_OUTPUT:-${GRUB_TERMINAL:-gfxterm}}
+  input=${GRUB_TERMINAL_INPUT:-${GRUB_TERMINAL:-console}}
 
-  cat <<EOF
-# Erzeugt von fedora-sb-sync – nicht von Hand bearbeiten.
-# Einstellungen: /etc/fedora-sb.conf, danach "sudo fedora-sb-sync".
-set timeout=$TIMEOUT
-set default=fedora-sb
-terminal_output console
-search --no-floppy --fs-uuid --set=root $boot_uuid
-
+  cat <<'EOF'
+# Erzeugt von fedora-sb-sync aus /etc/default/grub, /etc/grub.d/40_custom und
+# /etc/fedora-sb.conf – nicht von Hand bearbeiten. Nach Änderungen: "sudo fedora-sb-sync".
 EOF
+  for m in $GRUB_PRELOAD_MODULES; do
+    echo "insmod $m"
+  done
+  cat <<EOF
+if [ -s \$prefix/grubenv ]; then
+  load_env
+fi
+if [ "\${next_entry}" ] ; then
+  set default="\${next_entry}"
+  set next_entry=
+  save_env next_entry
+  set boot_once=true
+else
+  set default="$def"
+fi
 
-  if [[ -f $FEDORA_KERNEL ]]; then
-    cat <<EOF
-menuentry 'Arch Linux - Fedora-Kernel (Secure Boot / EAC)' --id fedora-sb {
-    echo 'Lade Fedora-Kernel ...'
-    linux $(grub_path "$FEDORA_KERNEL") $base $(eac_cmdline) $EXTRA_CMDLINE
-    $(initrd_line /boot/initramfs-linux-fedora.img)
+if [ x"\${feature_menuentry_id}" = xy ]; then
+  menuentry_id_option="--id"
+else
+  menuentry_id_option=""
+fi
+export menuentry_id_option
+
+function savedefault {
+  if [ -z "\${boot_once}" ]; then
+    saved_entry="\${chosen}"
+    save_env saved_entry
+  fi
+}
+
+function load_video {
+  insmod ${GRUB_VIDEO_BACKEND:-efi_gop}
 }
 
 EOF
+
+  if [[ $out == *gfxterm* ]]; then
+    if [[ -n $GRUB_FONT && -f $GRUB_FONT ]]; then
+      access_fs "$GRUB_FONT"
+      echo "font=\"$(grub_path "$GRUB_FONT")\""
+    else
+      echo 'font=unicode' # im Fedora-GRUB eingebaut
+    fi
+    cat <<EOF
+if loadfont \$font ; then
+  set gfxmode=$GRUB_GFXMODE
+  load_video
+  insmod gfxterm
+fi
+EOF
+  fi
+
+  # Sprache wie grub-mkconfig aus LANG, Übersetzungen aus /boot/grub/locale
+  lang=${LANG:-}
+  [[ -r /etc/locale.conf ]] && lang=$(. /etc/locale.conf 2>/dev/null; printf '%s' "${LANG:-}")
+  lang=${lang%%.*}
+  dir=/boot/grub/locale
+  if [[ -n $lang && $lang != C && $lang != POSIX && -d $dir ]]; then
+    access_fs "$dir"
+    printf 'set locale_dir=($root)%s\nset lang=%s\ninsmod gettext\n' "$(grub_path "$dir")" "$lang"
+  fi
+
+  if [[ "$input $out" == *serial* ]]; then
+    echo "$GRUB_SERIAL_COMMAND"
+  fi
+  echo "terminal_input $input"
+  echo "terminal_output $out"
+
+  case $GRUB_TIMEOUT_STYLE in
+    countdown|hidden) style=$GRUB_TIMEOUT_STYLE ;;
+    *) style=menu ;;
+  esac
+  printf 'set timeout_style=%s\nset timeout=%s\n' "$style" "${TIMEOUT:-$GRUB_TIMEOUT}"
+
+  if [[ -n $GRUB_COLOR_NORMAL ]]; then
+    echo "set menu_color_normal=$GRUB_COLOR_NORMAL"
+  fi
+  if [[ -n $GRUB_COLOR_HIGHLIGHT ]]; then
+    echo "set menu_color_highlight=$GRUB_COLOR_HIGHLIGHT"
+  fi
+
+  if [[ -n $GRUB_THEME && -f $GRUB_THEME ]]; then
+    dir=${GRUB_THEME%/*}
+    echo "insmod gfxmenu"
+    access_fs "$dir"
+    for f in "$dir"/*.pf2; do
+      printf 'loadfont ($root)%s\n' "$(grub_path "$f")"
+    done
+    printf 'insmod png\ninsmod jpeg\nset theme=($root)%s\nexport theme\n' "$(grub_path "$GRUB_THEME")"
+  elif [[ -n $GRUB_BACKGROUND ]]; then
+    warn "GRUB_BACKGROUND wird nicht übernommen: dem Fedora-GRUB fehlt background_image – stattdessen GRUB_THEME verwenden"
+  fi
+
+  if [[ -n $GRUB_INIT_TUNE ]]; then
+    echo "play $GRUB_INIT_TUNE"
+  fi
+
+  # 25_bli: Boot-Loader-Interface für systemd
+  cat <<'EOF'
+if [ "$grub_platform" = "efi" ]; then
+  insmod bli
+fi
+
+EOF
+}
+
+# 10_linux: Eintrag für den Fedora-Kernel; $1 = normal | recovery, $2 = Einrückung
+cfg_linux_entry() {
+  local mode=$1 i=${2:-} title id
+  if [[ $mode == recovery ]]; then
+    title="$OS - Fedora-Kernel (Wiederherstellung)" id=fedora-sb-recovery
+  else
+    title="$OS - Fedora-Kernel (Secure Boot / EAC)" id=fedora-sb
+  fi
+  echo "${i}menuentry '${title//\'/\'\\\'\'}' $CLASSES --id $id {"
+  if [[ $GRUB_SAVEDEFAULT == true ]]; then
+    echo "$i    savedefault"
+  fi
+  case $GRUB_GFXPAYLOAD_LINUX in
+    "") echo "$i    load_video" ;;
+    text) echo "$i    set gfxpayload=text" ;;
+    *) printf '%s    load_video\n%s    set gfxpayload=%s\n' "$i" "$i" "$GRUB_GFXPAYLOAD_LINUX" ;;
+  esac
+  echo "$i    insmod gzio"
+  access_fs "$FEDORA_KERNEL" "$i    "
+  echo "$i    echo 'Lade Fedora-Kernel ...'"
+  echo "$i    linux $(grub_path "$FEDORA_KERNEL") $(linux_cmdline "$mode")"
+  echo "$i    $(initrd_line /boot/initramfs-linux-fedora.img)"
+  echo "$i}"
+}
+
+# 30_os-prober (nur Windows auf der eigenen ESP) und 30_uefi-firmware
+cfg_other_entries() {
+  if [[ $WINDOWS_ENTRY == yes || ($WINDOWS_ENTRY == auto && $GRUB_DISABLE_OS_PROBER == false &&
+        -f $ESP/EFI/Microsoft/Boot/bootmgfw.efi) ]]; then
+    echo "menuentry 'Windows Boot Manager' --class windows --class os --id windows {"
+    if [[ $GRUB_SAVEDEFAULT == true ]]; then
+      echo "    savedefault"
+    fi
+    echo "    search --no-floppy --fs-uuid --set=root $(findmnt -no UUID "$ESP")"
+    echo "    chainloader /EFI/Microsoft/Boot/bootmgfw.efi"
+    printf '}\n\n'
+  fi
+  cat <<'EOF'
+fwsetup --is-supported
+if [ "$?" = 0 ]; then
+  menuentry 'UEFI-Firmware-Einstellungen' --id uefi-firmware {
+    fwsetup
+  }
+fi
+EOF
+}
+
+# 40_custom (und gleich aufgebaute Dateien in /etc/grub.d) sowie 41_custom
+cfg_custom() {
+  local f
+  for f in "$GRUB_CUSTOM_DIR"/*; do
+    [[ $f == *.pacnew || ($f == *.pacsave && -e ${f%.pacsave}) ]] && continue
+    [[ -f $f && $(sed -n 2p "$f") == 'exec tail -n +3 $0' ]] || continue
+    printf '\n### %s ###\n' "$f"
+    tail -n +3 "$f"
+  done
+  echo
+  if [[ -d /boot/grub ]]; then
+    printf 'search --no-floppy --fs-uuid --set=grub_dir %s\n' "$(findmnt -no UUID -T /boot/grub)"
+  fi
+  cat <<'EOF'
+if [ -f ${config_directory}/custom.cfg ]; then
+  source ${config_directory}/custom.cfg
+EOF
+  if [[ -d /boot/grub ]]; then
+    printf 'elif [ -f ($grub_dir)%s/custom.cfg ]; then\n  source ($grub_dir)%s/custom.cfg\n' \
+      "$(grub_path /boot/grub)" "$(grub_path /boot/grub)"
+  fi
+  echo "fi"
+}
+
+generate_cfg() {
+  cfg_header
+  if [[ -f $FEDORA_KERNEL ]]; then
+    cfg_linux_entry normal
+    if [[ $GRUB_DISABLE_RECOVERY != true ]]; then
+      if [[ $GRUB_DISABLE_SUBMENU == y || $GRUB_DISABLE_SUBMENU == true ]]; then
+        cfg_linux_entry recovery
+      else
+        echo "submenu 'Erweiterte Optionen für ${OS//\'/\'\\\'\'}' --id fedora-sb-advanced {"
+        cfg_linux_entry recovery "    "
+        echo "}"
+      fi
+    fi
+    echo
   else
     warn "$FEDORA_KERNEL fehlt – ist linux-fedora installiert?"
   fi
-
-  if [[ $OTHER_KERNELS == yes ]]; then
-    for img in /boot/vmlinuz-*; do
-      name=${img#/boot/vmlinuz-}
-      [[ $name == linux-fedora ]] && continue
-      [[ -f /boot/initramfs-$name.img ]] || continue
-      cat <<EOF
-menuentry 'Arch Linux - Kernel $name (nur ohne Secure Boot)' --id arch-$name {
-    linux $(grub_path "$img") $base
-    $(initrd_line "/boot/initramfs-$name.img")
-}
-
-EOF
-    done
-  fi
-
-  if [[ $WINDOWS_ENTRY == yes || ($WINDOWS_ENTRY == auto && -f $ESP/EFI/Microsoft/Boot/bootmgfw.efi) ]]; then
-    cat <<EOF
-menuentry 'Windows Boot Manager' --id windows {
-    search --no-floppy --fs-uuid --set=root $esp_uuid
-    chainloader /EFI/Microsoft/Boot/bootmgfw.efi
-}
-
-EOF
-  fi
-
-  cat <<'EOF'
-menuentry 'UEFI-Firmware-Einstellungen' --id uefi-firmware {
-    fwsetup
-}
-EOF
+  cfg_other_entries
+  cfg_custom
 }
 
 # Der Kernel in /boot muss byte-identisch mit dem von Fedora signierten sein
@@ -176,6 +404,25 @@ verify_kernel() {
     cmp -s "$orig" "$FEDORA_KERNEL" && return 0
   done
   warn "$FEDORA_KERNEL weicht vom Fedora-Original ab (neu signiert?) – sudo mkinitcpio -p linux-fedora"
+}
+
+# pkgbase aller installierten Kernel außer linux-fedora (z.B. AUR-Kernel)
+other_kernels() {
+  local d
+  for d in /usr/lib/modules/*/; do
+    [[ -f ${d}vmlinuz ]] || continue
+    [[ -r ${d}pkgbase && $(<"${d}pkgbase") == linux-fedora ]] && continue
+    if [[ -r ${d}pkgbase ]]; then cat "${d}pkgbase"; else basename "$d"; fi
+  done
+  return 0
+}
+
+# Für EAC Linux v2 soll nur der Fedora-Kernel installiert sein
+warn_other_kernels() {
+  local k
+  for k in $(other_kernels); do
+    warn "weiterer Kernel installiert: $k – für EAC nur linux-fedora behalten (sudo pacman -Rns $k)"
+  done
 }
 
 write_cfg() {
@@ -211,13 +458,26 @@ bootorder_first() {
   msg "Boot$id steht jetzt an erster Stelle"
 }
 
+# Startet zuerst ein anderer Linux-Bootloader (z.B. Arch-GRUB), sucht der nach dem
+# Entfernen der Arch-Kernel einen gelöschten Kernel -> Fedora-shim davorsetzen.
+# Windows oder eine selbst gewählte Reihenfolge bleiben unangetastet.
+takeover_bootorder() {
+  local first
+  [[ -f $FEDORA_KERNEL && -z $(other_kernels) ]] || return 0
+  first=$(efibootmgr | sed -n 's/^BootOrder: //p' | cut -d, -f1)
+  [[ -n $first ]] || return 0
+  efibootmgr | grep -iE "^Boot$first" | grep -viE "$LOADER_RE" | grep -qiE "$FOREIGN_RE" || return 0
+  msg "Boot$first startet einen anderen Linux-Bootloader"
+  bootorder_first
+}
+
 remove_all() {
   local id
   for id in $(boot_entries); do
     efibootmgr --bootnum "$id" --delete-bootnum >/dev/null && msg "UEFI-Eintrag Boot$id entfernt"
   done
   if [[ -e $MARKER ]]; then
-    rm -f -- "$DIR"/{shimx64.efi,mmx64.efi,grubx64.efi,grub.cfg} "$MARKER"
+    rm -f -- "$DIR"/{shimx64.efi,mmx64.efi,grubx64.efi,grub.cfg,grubenv} "$MARKER"
     rmdir --ignore-fail-on-non-empty -- "$DIR"
     msg "$DIR bereinigt"
   fi
@@ -236,14 +496,19 @@ check_esp
 
 case ${1:-} in
   ""|--hook)
+    restore_grub_files
     install_efi
     verify_kernel
+    warn_other_kernels
     write_cfg
     ensure_bootentry
+    takeover_bootorder
     ;;
   --bootorder-first)
+    restore_grub_files
     install_efi
     verify_kernel
+    warn_other_kernels
     write_cfg
     ensure_bootentry
     bootorder_first

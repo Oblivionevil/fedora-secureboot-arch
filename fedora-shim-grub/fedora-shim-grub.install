@@ -2,13 +2,18 @@ post_install() {
   cat <<'EOF'
 ==> fedora-shim-grub ist installiert.
     Fedora shim + GRUB liegen jetzt unter ESP/EFI/fedora/ und es gibt einen
-    UEFI-Eintrag "Fedora Secure Boot (Arch)", der aber noch NICHT als Erstes startet.
+    UEFI-Eintrag "Fedora Secure Boot (Arch)". Er startet erst dann als Erstes,
+    wenn bisher ein anderer Linux-Bootloader vorne stand und nur noch
+    linux-fedora installiert ist.
+    Für EAC sollen nur Fedora-GRUB und Fedora-Kernel übrig bleiben: alte
+    Kernel, Bootloader auf der ESP und UEFI-Einträge zeigt fedora-sb-check.
 
     1. Kontrollieren:            sudo fedora-sb-check
     2. Als Standard setzen:      sudo fedora-sb-sync --bootorder-first
     3. Im BIOS/UEFI die Secure-Boot-Schlüssel auf Werkseinstellung zurücksetzen
        (eigene sbctl-Schlüssel entfernen) und Secure Boot einschalten.
-    Kernel-Parameter:            /etc/fedora-sb.conf, danach sudo fedora-sb-sync
+    GRUB-Einstellungen bleiben in /etc/default/grub und /etc/grub.d/40_custom,
+    nach Änderungen dort:        sudo fedora-sb-sync  (statt grub-mkconfig)
 EOF
 }
 

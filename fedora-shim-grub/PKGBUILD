@@ -3,10 +3,11 @@
 # Fedora shim (Microsoft-signiert) und Fedora GRUB (Fedora-signiert) plus die
 # Werkzeuge, die beides auf die ESP bringen und grub.cfg erzeugen.
 # Die exakten Versionen kommen aus dem Branch "versions-bootloader" (GitHub-Bot).
+# Für EAC Linux v2 ist das der einzige Bootloader: Arch-GRUB & Co. werden ersetzt.
 
 pkgname=fedora-shim-grub
 pkgver=1.shim16.1_7.grub2.12_66
-pkgrel=2
+pkgrel=3
 pkgdesc='Fedora shim + GRUB for Secure Boot on Arch, with ESP sync hooks (EAC Linux v2)'
 arch=(x86_64)
 url='https://src.fedoraproject.org/rpms/shim'
@@ -16,6 +17,7 @@ makedepends=(git curl rpm-tools)
 optdepends=('linux-fedora: Fedora-signierter Kernel'
             'python: Auswertung der Secure-Boot-Datenbanken in fedora-sb-check'
             'openssl: Auswertung der Secure-Boot-Datenbanken in fedora-sb-check')
+conflicts=(grub refind limine)
 backup=(etc/fedora-sb.conf)
 options=(!strip !debug)
 install=fedora-shim-grub.install
@@ -34,10 +36,10 @@ source=("versions::git+${_repo}#branch=versions-bootloader"
 sha256sums=('SKIP'
             '93642aec521a1e5e96dd715f7ae0ec0850ebc9de09a94ce03cae5263f26cc18a'
             '846912c73a910dab32da8ef0c0d68cb89d11ff514f598d2d1dd96d04d58b2425'
-            '33b584a7265981c730e7d312331ba88c92a11ca6b92d1d0c6807af1696a52aba'
-            'e41022444591ac57002616b37c08ba15d8afe0f6e1ec128b36273af0c62fdeca'
-            'a6e9afb781d7198910848d3a3907025fb29834b86a4481ef40dfbafd6fde94bc'
-            'd489e307e5538fb68b44ef23d209dd55ed1d4db124f96ac804bfc8e611148751'
+            '5a2a6cbd5af9ff5c03e1e9079ce0af1f95d6db47bef47c59572ac36fe78831ad'
+            '2e6ee5d0b6a66d4781b56a429c6ca4906576d92699f79857cace6b708a7821f3'
+            'd78ac054a479a0811b837ed42e1ec4ad0b073626ccbad2a1e9c63066a83fa6cf'
+            '5d26fe288daf3ff0c43ec1095148996369f4221329d08b41479386e4642233c3'
             '6f46d39523d3ccbe36f410cb9b99c8168ee34bcdbffecaef0bc5b930ec2c2044')
 
 _load() {

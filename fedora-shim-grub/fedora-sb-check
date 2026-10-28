@@ -7,6 +7,12 @@ shopt -s nullglob
 GUID_GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
 GUID_DB=d719b2cb-3d3a-4596-a3bc-dad00e67656f
 EFIVARS=/sys/firmware/efi/efivars
+LOADER_RE='\\EFI\\fedora\\shimx64\.efi'
+# Andere Linux-Bootloader (Arch-GRUB, systemd-boot, rEFInd, Limine, UKIs) – wie in fedora-sb-sync
+FOREIGN_RE='[\\/]EFI[\\/](limine|linux)[\\/]|[\\/](grub|shim|systemd-boot|refind|limine)[^\\/]*\.efi'
+ESP=/boot/efi
+# shellcheck disable=SC1091
+[[ -r /etc/fedora-sb.conf ]] && . /etc/fedora-sb.conf
 declare -i bad=0
 
 ok()   { printf '  \e[32m[ OK ]\e[0m %s\n' "$*"; }
@@ -99,6 +105,39 @@ lsm=$(cat /sys/kernel/security/lsm 2>/dev/null || echo "?")
 groups=(/sys/kernel/iommu_groups/*)
 (( ${#groups[@]} )) && ok "IOMMU aktiv (${#groups[@]} Gruppen)" || fail "keine IOMMU-Gruppen – IOMMU/VT-d im UEFI aktivieren"
 grep -qE '(^| )(iommu=pt|iommu.passthrough=1)( |$)' /proc/cmdline && fail "IOMMU-Passthrough ist eingeschaltet" || ok "kein IOMMU-Passthrough"
+
+echo "Nur Fedora-GRUB und Fedora-Kernel"
+before=$bad
+seen=" "
+for d in /usr/lib/modules/*/; do
+  [[ -f ${d}vmlinuz ]] || continue
+  pb=$(cat "${d}pkgbase" 2>/dev/null || echo "?")
+  [[ $pb == linux-fedora ]] && continue
+  seen+="$pb "
+  fail "weiterer Kernel installiert: $pb (${d%/})  -> sudo pacman -Rns $pb"
+done
+for img in /boot/vmlinuz-*; do
+  name=${img#/boot/vmlinuz-}
+  [[ $name == linux-fedora || $seen == *" $name "* ]] && continue
+  fail "übrig gebliebener Kernel: $img  -> löschen"
+done
+if command -v pacman >/dev/null; then
+  for p in grub refind limine; do
+    pacman -Qq "$p" &>/dev/null && fail "Bootloader-Paket installiert: $p  -> sudo pacman -Rns $p"
+  done
+fi
+if command -v efibootmgr >/dev/null; then
+  while IFS= read -r line; do
+    fail "weiterer Linux-Booteintrag: ${line%%$'\t'*}  -> sudo efibootmgr -b ${line:4:4} -B"
+  done < <(efibootmgr 2>/dev/null | grep -E '^Boot[0-9A-Fa-f]{4}' | grep -viE "$LOADER_RE" | grep -iE "$FOREIGN_RE")
+fi
+if [[ -d $ESP/EFI ]]; then
+  while IFS= read -r -d '' f; do
+    fail "anderer Bootloader auf der ESP: $f  -> sudo rm -r ${f%/*}"
+  done < <(find "$ESP/EFI" -mindepth 2 -type f -iname '*.efi' -not -ipath "$ESP/EFI/fedora/*" \
+             -not -ipath "$ESP/EFI/Microsoft/*" -print0 | grep -ziE "$FOREIGN_RE" | sort -z)
+fi
+(( bad == before )) && ok "nur Fedora-GRUB und Fedora-Kernel installiert"
 
 echo "TPM / Measured Boot"
 v=$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo "?")

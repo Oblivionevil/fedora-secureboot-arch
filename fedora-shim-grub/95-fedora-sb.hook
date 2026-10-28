@@ -5,6 +5,12 @@ Operation = Upgrade
 Target = fedora-shim-grub
 Target = linux-fedora
 
+# Arch-grub entfernt: /etc/default/grub aus der .pacsave zurückholen
+[Trigger]
+Type = Package
+Operation = Remove
+Target = grub
+
 [Trigger]
 Type = Path
 Operation = Install
